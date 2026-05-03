@@ -14,7 +14,6 @@ admin_bot.py — Партнёрский бот Reserva
  
 import logging
 import hashlib
-import httpx
 from urllib.parse import quote
  
 from aiogram import Bot, Dispatcher, F, Router
@@ -113,7 +112,7 @@ T = {
         "terms_accept":  "✅ Принимаю условия и регистрируюсь",
         "terms_decline": "❌ Не принимаю",
         "terms_declined":"Без принятия условий регистрация невозможна.\nНапишите /start чтобы начать заново.",
-        "enter_bin":     "Введите БИН вашей организации (12 цифр):",
+        "enter_bin":     "Введите ИИН/БИН (12 цифр):",
         "bin_checking":  "🔍 Проверяю БИН в реестре РК...",
         "bin_invalid":   "БИН должен содержать ровно 12 цифр. Попробуйте ещё раз:",
         "bin_not_found": "❌ Организация с таким БИН не найдена в реестре РК.\nПроверьте правильность ввода.",
@@ -164,7 +163,7 @@ T = {
         "terms_accept":  "✅ Шарттарды қабылдаймын",
         "terms_decline": "❌ Қабылдамаймын",
         "terms_declined":"Шарттарды қабылдаусыз тіркелу мүмкін емес.\n/start жазып қайтадан бастаңыз.",
-        "enter_bin":     "Ұйымыңыздың БИН-ін енгізіңіз (12 сан):",
+        "enter_bin":     "ИИН/БИН енгізіңіз (12 сан):",
         "bin_checking":  "🔍 БИН РК тізілімінде тексерілуде...",
         "bin_invalid":   "БИН 12 саннан тұруы керек. Қайталап көріңіз:",
         "bin_not_found": "❌ Бұл БИН бар ұйым РК тізілімінде табылмады.",
@@ -215,7 +214,7 @@ T = {
         "terms_accept":  "✅ I accept and register",
         "terms_decline": "❌ I decline",
         "terms_declined":"Registration requires accepting the terms.\nType /start to begin again.",
-        "enter_bin":     "Enter your organization's BIN (12 digits):",
+        "enter_bin":     "Enter your IIN/BIN (12 digits):",
         "bin_checking":  "🔍 Checking BIN in RK registry...",
         "bin_invalid":   "BIN must be exactly 12 digits. Please try again:",
         "bin_not_found": "❌ Organization not found in RK registry.",
@@ -274,7 +273,6 @@ class AdminState(StatesGroup):
     pick_lang           = State()
     terms               = State()
     reg_bin             = State()
-    reg_bin_confirm     = State()
     reg_brand           = State()
     reg_type            = State()
     reg_city            = State()
@@ -386,34 +384,6 @@ def kb_plans(lang: str, promo: bool):
 # БИН-ПРОВЕРКА
 # ══════════════════════════════════════════
  
-ALLOWED_OKVED_PREFIXES = ["56", "55"]
- 
-async def check_bin(bin_code: str) -> dict:
-    try:
-        url = f"https://stat.gov.kz/api/juridical/getData/?bin={bin_code}&lang=ru"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url)
-        if resp.status_code != 200:
-            return {"status": "api_error"}
-        data = resp.json()
-        if not data or not isinstance(data, list) or len(data) == 0:
-            return {"status": "not_found"}
-        org = data[0]
-        activity_name = (org.get("activity") or {}).get("nameRu", "").lower()
-        if any(w in activity_name for w in ["ликвидир", "прекращ", "банкрот"]):
-            return {"status": "inactive"}
-        okved = str((org.get("oked") or {}).get("code", ""))
-        is_food = any(okved.startswith(p) for p in ALLOWED_OKVED_PREFIXES)
-        return {
-            "status":  "ok" if is_food else "wrong_okved",
-            "name":    org.get("name", ""),
-            "okved":   okved,
-            "address": (org.get("address") or {}).get("ru", ""),
-            "is_food": is_food,
-        }
-    except Exception as e:
-        logger.error(f"BIN check error: {e}")
-        return {"status": "api_error", "name": "", "okved": "—", "address": ""}
  
  
 # ══════════════════════════════════════════
@@ -551,43 +521,12 @@ async def reg_bin_handler(msg: Message, state: FSMContext):
     lang = await get_lang(msg.from_user.id, state)
     bin_code = msg.text.strip().replace(" ", "")
     if not bin_code.isdigit() or len(bin_code) != 12:
-        await msg.answer(at(lang, "bin_invalid"))
+        await msg.answer("ИИН/БИН должен содержать 12 цифр. Попробуйте ещё раз:")
         return
-    wait = await msg.answer(at(lang, "bin_checking"))
-    result = await check_bin(bin_code)
-    await wait.delete()
- 
-    if result["status"] == "not_found":
-        await msg.answer(at(lang, "bin_not_found"))
-        return
-    if result["status"] == "inactive":
-        await msg.answer(at(lang, "bin_inactive"))
-        return
-    if result["status"] == "wrong_okved":
-        await msg.answer(at(lang, "bin_okved_fail"))
-        return
- 
-    name    = result.get("name", "—")
-    okved   = result.get("okved", "—")
-    address = result.get("address", "")
- 
-    await state.update_data(bin=bin_code, legal_name=name, okved=okved, legal_address=address)
-    await msg.answer(
-        at(lang, "bin_ok", name, okved),
-        reply_markup=kb_yes_no(at(lang, "bin_confirm"), at(lang, "bin_reenter"))
-    )
-    await state.set_state(AdminState.reg_bin_confirm)
- 
- 
-@admin_router.message(AdminState.reg_bin_confirm)
-async def reg_bin_confirm(msg: Message, state: FSMContext):
-    lang = await get_lang(msg.from_user.id, state)
-    if "✅" in msg.text:
-        await msg.answer(at(lang, "enter_brand"), reply_markup=ReplyKeyboardRemove())
-        await state.set_state(AdminState.reg_brand)
-    else:
-        await msg.answer(at(lang, "enter_bin"), reply_markup=ReplyKeyboardRemove())
-        await state.set_state(AdminState.reg_bin)
+    # Сохраняем БИН без проверки — владелец одобряет вручную
+    await state.update_data(bin=bin_code)
+    await msg.answer(at(lang, "enter_brand"), reply_markup=ReplyKeyboardRemove())
+    await state.set_state(AdminState.reg_brand)
  
  
 @admin_router.message(AdminState.reg_brand)
@@ -1253,3 +1192,4 @@ async def notify_user_cancelled(booking_id: int):
         )
     except Exception as e:
         logger.error(f"notify_cancelled error: {e}")
+ 
